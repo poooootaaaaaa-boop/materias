@@ -23,8 +23,8 @@ Route::get('/locations', fn () => response()->json([
         ->filter()->all(),
 ]));
 
+// Pagos públicos: la clave pública y el webhook de Stripe
 Route::get('/payments/config', [PaymentController::class, 'config']);
-Route::post('/payments/checkout', [PaymentController::class, 'checkout']);
 Route::post('/payments/webhook', [PaymentController::class, 'webhook']);
 
 // Progreso en modo invitado (ninos sin cuenta)
@@ -34,6 +34,11 @@ Route::post('/progress/guest', [ProgressController::class, 'store']);
 Route::middleware('auth:sanctum')->group(function () {
     Route::get('/user', [AuthController::class, 'user']);
     Route::post('/logout', [AuthController::class, 'logout']);
+
+    // Pagos (requieren usuario para poder entregar lo comprado)
+    Route::post('/payments/checkout', [PaymentController::class, 'checkout']);
+    Route::post('/payments/payment-sheet', [PaymentController::class, 'paymentSheet']);
+    Route::post('/payments/confirm', [PaymentController::class, 'confirm']);
 
     // Progreso del usuario autenticado
     Route::get('/progress', [ProgressController::class, 'mine']);

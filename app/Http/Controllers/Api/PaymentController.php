@@ -6,6 +6,7 @@ use App\Http\Controllers\Controller;
 use App\Models\Purchase;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Stripe\Exception\SignatureVerificationException;
 use Stripe\StripeClient;
@@ -31,6 +32,9 @@ class PaymentController extends Controller
         return response()->json(['publishable_key' => config('services.stripe.key')]);
     }
 
+    /**
+     * Checkout con redirección (versión web / navegador).
+     */
     public function checkout(Request $request): JsonResponse
     {
         $data = $request->validate(['product_key' => ['required', 'string']]);
@@ -70,6 +74,70 @@ class PaymentController extends Controller
         return response()->json(['url' => $session->url]);
     }
 
+    /**
+     * Payment Sheet (app Android): crea el PaymentIntent y devuelve el client_secret.
+     */
+    public function paymentSheet(Request $request): JsonResponse
+    {
+        $data = $request->validate(['product_key' => ['required', 'string']]);
+        $product = self::PRODUCTS[$data['product_key']] ?? null;
+        abort_unless($product, 422, 'Producto no válido.');
+
+        $user = $request->user();
+
+        $purchase = Purchase::create([
+            'user_id' => $user->id,
+            'product_key' => $data['product_key'],
+            'product_type' => $product['type'],
+            'amount' => $product['amount'],
+            'currency' => 'mxn',
+        ]);
+
+        $stripe = new StripeClient(config('services.stripe.secret'));
+
+        $intent = $stripe->paymentIntents->create([
+            'amount' => $product['amount'],
+            'currency' => 'mxn',
+            'automatic_payment_methods' => ['enabled' => true],
+            'metadata' => [
+                'purchase_id' => (string) $purchase->id,
+                'user_id' => (string) $user->id,
+            ],
+        ]);
+
+        $purchase->update(['stripe_payment_intent_id' => $intent->id]);
+
+        return response()->json([
+            'client_secret' => $intent->client_secret,
+            'payment_intent_id' => $intent->id,
+        ]);
+    }
+
+    /**
+     * La app llama aquí después de pagar. Se le pregunta a Stripe si el pago salió bien
+     * y, si es así, se entrega lo comprado al instante.
+     */
+    public function confirm(Request $request): JsonResponse
+    {
+        $data = $request->validate(['payment_intent_id' => ['required', 'string']]);
+
+        $purchase = Purchase::where('stripe_payment_intent_id', $data['payment_intent_id'])
+            ->where('user_id', $request->user()->id)
+            ->firstOrFail();
+
+        $stripe = new StripeClient(config('services.stripe.secret'));
+        $intent = $stripe->paymentIntents->retrieve($data['payment_intent_id']);
+
+        if ($intent->status === 'succeeded') {
+            $this->markPaid($purchase);
+        }
+
+        return response()->json([
+            'status' => $intent->status,
+            'paid' => $intent->status === 'succeeded',
+        ]);
+    }
+
     public function webhook(Request $request): JsonResponse
     {
         $payload = $request->getContent();
@@ -87,22 +155,40 @@ class PaymentController extends Controller
         }
 
         if ($event->type === 'checkout.session.completed') {
-            $session = $event->data->object;
+            $purchase = Purchase::where('stripe_session_id', $event->data->object->id)->first();
+            if ($purchase) {
+                $this->markPaid($purchase);
+            }
+        }
 
-            /** @var Purchase|null $purchase */
-            $purchase = Purchase::where('stripe_session_id', $session->id)->first();
-
-            if ($purchase && $purchase->status !== 'paid') {
-                $purchase->update([
-                    'status' => 'paid',
-                    'fulfilled_at' => now(),
-                ]);
-
-                $this->fulfill($purchase);
+        if ($event->type === 'payment_intent.succeeded') {
+            $purchase = Purchase::where('stripe_payment_intent_id', $event->data->object->id)->first();
+            if ($purchase) {
+                $this->markPaid($purchase);
             }
         }
 
         return response()->json(['received' => true]);
+    }
+
+    /**
+     * Marca la compra como pagada y entrega lo comprado una sola vez,
+     * aunque confirm() y el webhook lleguen al mismo tiempo.
+     */
+    private function markPaid(Purchase $purchase): void
+    {
+        DB::transaction(function () use ($purchase) {
+            $locked = Purchase::whereKey($purchase->id)->lockForUpdate()->first();
+
+            if ($locked && $locked->status !== 'paid') {
+                $locked->update([
+                    'status' => 'paid',
+                    'fulfilled_at' => now(),
+                ]);
+
+                $this->fulfill($locked);
+            }
+        });
     }
 
     /**
@@ -112,7 +198,7 @@ class PaymentController extends Controller
     private function fulfill(Purchase $purchase): void
     {
         if (!$purchase->user_id) {
-            return; // compra de invitado sin cuenta; decide cómo manejarlo si aplica
+            return; // compra de invitado sin cuenta
         }
 
         $user = $purchase->user()->first();
