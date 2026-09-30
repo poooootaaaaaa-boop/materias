@@ -6,22 +6,17 @@ use Illuminate\Support\Facades\Schema;
 
 return new class extends Migration
 {
-    /**
-     * Run the migrations.
-     */
     public function up(): void
     {
-        Schema::create('products', function (Blueprint $table) {
-            $table->id();
-            $table->timestamps();
+        Schema::table('purchases', function (Blueprint $table) {
+            $table->string('stripe_payment_intent_id')->nullable()->index();
         });
     }
 
-    /**
-     * Reverse the migrations.
-     */
     public function down(): void
     {
-        Schema::dropIfExists('products');
+        Schema::table('purchases', function (Blueprint $table) {
+            $table->dropColumn('stripe_payment_intent_id');
+        });
     }
 };
